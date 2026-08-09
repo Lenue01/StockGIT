@@ -12,7 +12,7 @@ from torch.utils.data import DataLoader
 import config
 from dataset import MaskedWindowDataset
 from model import MaskedWindowDenoiser, masked_reconstruction_loss
-from sample import forecast
+from sample import evaluate, forecast, persistence_forecast
 from windows import NUM_PRICE_VOLUME_FEATURES, build_dataset, chronological_split
 
 
@@ -49,7 +49,7 @@ def save_snapshot(model, viz_window, viz_ticker, epoch, train_loss, val_loss, de
     )
 
 
-def run_epoch(model, loader, optimizer, device, train, feature_weights):
+def run_epoch(model, loader, optimizer, device, train, feature_weights, self_cond_prob=0.5):
     model.train(train)
     total_loss, total_batches = 0.0, 0
 
@@ -60,7 +60,21 @@ def run_epoch(model, loader, optimizer, device, train, feature_weights):
             t = batch['t'].to(device)
             target = batch['target'].to(device)
 
-            pred = model(x, mask, t)
+            # Self-conditioning: half the time, give the model a (no-grad)
+            # draft of its own prediction as extra context, then supervise a
+            # second pass that has access to it -- this is what teaches the
+            # model to use/correct a prior guess at inference, instead of
+            # only ever knowing how to fill a mask from real context once.
+            # The other half keeps self_cond=None so it still works with no
+            # prior guess (the first sampling step, or if self-conditioning
+            # were disabled). Draft pass is always no-grad regardless of
+            # `train` -- it's not something we backprop through.
+            self_cond = None
+            if np.random.rand() < self_cond_prob:
+                with torch.no_grad():
+                    self_cond = model(x, mask, t).detach()
+
+            pred = model(x, mask, t, self_cond=self_cond)
             loss = masked_reconstruction_loss(pred, target, mask, feature_weights)
 
             if train:
@@ -92,6 +106,16 @@ def main():
     # happened to be first always got shown, no matter what else was added).
     viz_tickers = list(np.unique(val_tickers))
     viz_windows = {t: val_windows[np.where(val_tickers == t)[0][0]] for t in viz_tickers}
+
+    # Fixed sample (separate RNG so it doesn't disturb the dataset's own
+    # masking/shuffling randomness) for a per-epoch directional-accuracy /
+    # MAE readout against the persistence baseline -- this is the number
+    # that actually says whether it's learning something useful, not loss.
+    dir_acc_idx = np.random.default_rng(config.SEED).choice(
+        len(val_windows), size=min(config.DIR_ACC_SAMPLE_SIZE, len(val_windows)), replace=False)
+    dir_acc_windows = val_windows[dir_acc_idx]
+    baseline_mae, baseline_dir_acc = evaluate(persistence_forecast, dir_acc_windows)
+    print(f'persistence baseline ({len(dir_acc_windows)} windows): MAE={baseline_mae:.4f}  dir_acc={baseline_dir_acc:.3f}')
 
     train_loader = DataLoader(MaskedWindowDataset(train_windows), batch_size=config.BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(MaskedWindowDataset(val_windows), batch_size=config.BATCH_SIZE, shuffle=False)
@@ -132,7 +156,13 @@ def main():
             viz_ticker = viz_tickers[(epoch - 1) % len(viz_tickers)]
             save_snapshot(model, viz_windows[viz_ticker], viz_ticker, epoch, train_loss, val_loss, device)
 
-        print(f'epoch {epoch:3d}/{config.EPOCHS}  lr={lr:.2e}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}{marker}')
+        was_training = model.training
+        model.eval()
+        mae, dir_acc = evaluate(lambda w: forecast(model, w, device=device), dir_acc_windows)
+        model.train(was_training)
+
+        print(f'epoch {epoch:3d}/{config.EPOCHS}  lr={lr:.2e}  train_loss={train_loss:.4f}  val_loss={val_loss:.4f}{marker}  '
+              f'MAE={mae:.4f}  dir_acc={dir_acc:.3f} (persistence={baseline_dir_acc:.3f})')
 
 
 if __name__ == '__main__':

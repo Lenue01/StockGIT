@@ -6,7 +6,7 @@ import numpy as np
 import torch
 
 import config
-from dataset import MASK_VALUE, cosine_mask_ratio
+from dataset import MASK_VALUE
 from model import MaskedWindowDenoiser
 from windows import NUM_PRICE_VOLUME_FEATURES, build_dataset, chronological_split
 
@@ -15,7 +15,7 @@ CLOSE_COL = 3  # index of Close in [Open, High, Low, Close, Volume]
 
 def cosine_mask_ratio_inverse(ratio):
     # Inverse of cosine_mask_ratio: given a target mask fraction, find the t
-    # that produces it, so the reveal schedule can start exactly at `horizon`.
+    # that the schedule should start at, so it starts at exactly `horizon`.
     ratio = np.clip(ratio, 0.0, 1.0)
     return (2 / np.pi) * np.arccos(1 - ratio)
 
@@ -24,38 +24,56 @@ def cosine_mask_ratio_inverse(ratio):
 def forecast(model, context, horizon=config.FORECAST_HORIZON, steps=config.SAMPLING_STEPS, device='cpu'):
     """context: (WINDOW_SIZE, 5) array where the last `horizon` rows are
     unknown (any placeholder values -- they get overwritten). Returns a
-    (WINDOW_SIZE, 5) array with the last `horizon` rows filled in by
-    progressively revealing more of the schedule each step, using the
-    model's own predictions as the newly "known" values."""
+    (WINDOW_SIZE, 5) array with the last `horizon` rows filled in.
+
+    Unlike the old progressive-unmasking version, the horizon stays fully
+    masked (mask=0, x=MASK_VALUE) for every step -- it's never permanently
+    frozen a position at a time. Instead each step re-predicts the whole
+    horizon from scratch and feeds that guess back in as self-conditioning
+    for the next step, so later steps can revise earlier ones. This only
+    works because training actually supervises the model to use self_cond
+    (see run_epoch's self-conditioning pass) -- earlier we tried refining
+    positions through the `mask=1`/x pathway instead and it blew up,
+    because that pathway is never supervised by masked_reconstruction_loss
+    (loss only applies where mask=0) so the model has no idea what to do
+    with a value written there. self_cond is the pathway actually trained
+    for this.
+
+    t stays fixed at t_start across every step, rather than decaying to 0
+    the way the old schedule did -- t is what tells the model how much of
+    the window is masked, and here that never changes (always exactly
+    `horizon` positions), so decaying t would tell the model "almost
+    everything is known" while still showing it the same 10 unknown
+    positions: a (t, mask) combination it never saw in training, since
+    training always ties t to the actual mask size via mask_ratio_fn. Only
+    self_cond is meant to signal "this is a later, more-informed guess."
+    """
     window_size = context.shape[0]
+    horizon_start = window_size - horizon
     t_start = cosine_mask_ratio_inverse(horizon / window_size)
-    schedule = np.linspace(t_start, 0.0, steps + 1)
+    t = torch.full((1,), t_start, dtype=torch.float32, device=device)
 
     x = context.copy()
     mask = np.ones(window_size, dtype=np.float32)
-    mask[window_size - horizon:] = 0.0
+    mask[horizon_start:] = 0.0
     # Only price/volume get blanked out -- the time-of-session channels stay
     # real even for "masked" positions, since the future timestamp is known.
-    x[mask == 0, :NUM_PRICE_VOLUME_FEATURES] = MASK_VALUE
+    # This never changes during sampling -- the horizon stays "masked" the
+    # whole time, exactly like every training example.
+    x[horizon_start:, :NUM_PRICE_VOLUME_FEATURES] = MASK_VALUE
 
     x_t = torch.from_numpy(x).float().unsqueeze(0).to(device)
     mask_t = torch.from_numpy(mask).float().unsqueeze(0).to(device)
+    self_cond = torch.zeros(1, window_size, NUM_PRICE_VOLUME_FEATURES, device=device)
 
+    pred = None
     for i in range(steps):
-        t = torch.tensor([schedule[i]], dtype=torch.float32, device=device)
-        pred = model(x_t, mask_t, t)  # (1, T, NUM_PRICE_VOLUME_FEATURES)
+        pred = model(x_t, mask_t, t, self_cond=self_cond)  # (1, T, NUM_PRICE_VOLUME_FEATURES)
+        self_cond = pred  # next step gets to see and revise this step's guess
 
-        next_mask_len = int(round(cosine_mask_ratio(schedule[i + 1]) * window_size))
-        reveal_from = window_size - next_mask_len
-        cur_masked_from = window_size - int(round(cosine_mask_ratio(schedule[i]) * window_size))
-
-        # Positions that go from "masked" to "revealed" this step: accept
-        # the model's prediction as the new known value going forward.
-        if reveal_from > cur_masked_from:
-            x_t[0, cur_masked_from:reveal_from, :NUM_PRICE_VOLUME_FEATURES] = pred[0, cur_masked_from:reveal_from]
-            mask_t[0, cur_masked_from:reveal_from] = 1.0
-
-    return x_t.squeeze(0).cpu().numpy()
+    result = x_t.clone()
+    result[0, horizon_start:, :NUM_PRICE_VOLUME_FEATURES] = pred[0, horizon_start:]
+    return result.squeeze(0).cpu().numpy()
 
 
 def persistence_forecast(context, horizon=config.FORECAST_HORIZON):

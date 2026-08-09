@@ -35,8 +35,13 @@ class MaskedWindowDenoiser(nn.Module):
         super().__init__()
         self.window_size = window_size
 
-        # +1 channel for the mask flag, so the model knows what's real vs placeholder.
-        self.input_proj = nn.Linear(NUM_FEATURES + 1, d_model)
+        # +1 channel for the mask flag (real vs placeholder), + NUM_PRICE_VOLUME_FEATURES
+        # for self-conditioning: the model's own previous-step guess at the
+        # masked price/volume channels, fed back in as extra context so it can
+        # revise earlier guesses instead of never seeing them again. Zeroed
+        # when there's no prior guess yet (first step, or non-self-conditioned
+        # training passes) -- see masked_reconstruction_loss and run_epoch.
+        self.input_proj = nn.Linear(NUM_FEATURES + 1 + NUM_PRICE_VOLUME_FEATURES, d_model)
         self.pos_embed = nn.Parameter(torch.randn(1, window_size, d_model) * 0.02)
         self.t_embed = SinusoidalEmbedding(d_model)
 
@@ -53,12 +58,21 @@ class MaskedWindowDenoiser(nn.Module):
         # timesteps, since the future timestamp is known), never reconstructed.
         self.output_proj = nn.Linear(d_model, NUM_PRICE_VOLUME_FEATURES)
 
-    def forward(self, x, mask, t):
+    def forward(self, x, mask, t, self_cond=None):
         # x: (B, T, NUM_FEATURES) input (price/vol masked, time always real),
-        # mask: (B, T) 1=known/0=masked, t: (B,)
-        h = torch.cat([x, mask.unsqueeze(-1)], dim=-1)  # (B, T, NUM_FEATURES + 1)
+        # mask: (B, T) 1=known/0=masked, t: (B,),
+        # self_cond: (B, T, NUM_PRICE_VOLUME_FEATURES) previous-step guess at
+        # the masked channels, or None (treated as zeros) when there isn't one.
+        if self_cond is None:
+            self_cond = x.new_zeros(x.shape[0], x.shape[1], NUM_PRICE_VOLUME_FEATURES)
+
+        h = torch.cat([x, mask.unsqueeze(-1), self_cond], dim=-1)  # (B, T, NUM_FEATURES + 1 + NUM_PRICE_VOLUME_FEATURES)
         h = self.input_proj(h) + self.pos_embed
 
+        # t is still the same mask-ratio scalar as before (unchanged by
+        # self-conditioning) -- both the no-grad draft pass and the real
+        # supervised pass in run_epoch use the same t, same as how a
+        # diffusion model conditions on one noise level per step.
         t_emb = self.t_embed(t).unsqueeze(1)  # (B, 1, d_model), broadcast over sequence
         h = h + t_emb
 
