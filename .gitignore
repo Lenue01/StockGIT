@@ -1,0 +1,25 @@
+# Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+
+# Cache and build artifacts
+.cache/
+snapshots/
+*.npz
+
+# Model checkpoints and generated outputs
+denoiser.pt
+
+# Editors and OS files
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Local tool state
+.claude/
